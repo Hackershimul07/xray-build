@@ -1,0 +1,85 @@
+name: Build Xray core (libv2ray.aar)
+
+on:
+  workflow_dispatch:
+    inputs:
+      lib_ref:
+        description: "AndroidLibXrayLite branch / tag / commit"
+        default: "main"
+      xray_version:
+        description: "Optional xray-core override (e.g. v25.1.1). Empty = version pinned by the repo"
+        default: ""
+      android_api:
+        description: "gomobile -androidapi (keep 21 to match minSdk 21)"
+        default: "21"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      LIB_REF: ${{ inputs.lib_ref }}
+      XRAY_VERSION: ${{ inputs.xray_version }}
+      ANDROID_API: ${{ inputs.android_api }}
+      NDK_VERSION: 27.2.12479018
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Clone AndroidLibXrayLite
+        run: |
+          git clone https://github.com/2dust/AndroidLibXrayLite.git lib
+          cd lib
+          git checkout "$LIB_REF"
+          git log -1 --format='lib commit: %H %cd'
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: lib/go.mod
+          cache: false
+
+      - name: Install Android NDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;${NDK_VERSION}" "platforms;android-34"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Install gomobile
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gobind@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          "$(go env GOPATH)/bin/gomobile" init
+
+      - name: Build libv2ray.aar
+        working-directory: lib
+        run: |
+          if [ -n "$XRAY_VERSION" ]; then
+            go get "github.com/xtls/xray-core@${XRAY_VERSION}"
+          fi
+          go mod tidy -v
+          grep 'xtls/xray-core ' go.mod || true
+          gomobile bind -v \
+            -target=android/arm64,android/arm \
+            -androidapi "$ANDROID_API" \
+            -trimpath \
+            -ldflags='-s -w -buildid= -checklinkname=0' \
+            -o libv2ray.aar ./
+
+      - name: Add geoip/geosite into the aar assets
+        working-directory: lib
+        run: |
+          mkdir -p pack/assets
+          curl -fsSL -o pack/assets/geoip.dat   https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat
+          curl -fsSL -o pack/assets/geosite.dat https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat
+          (cd pack && zip -r ../libv2ray.aar assets)
+          unzip -l libv2ray.aar | grep -E 'jni/|assets/|classes.jar'
+          mkdir -p ../out
+          cp libv2ray.aar ../out/libv2ray.aar
+          cp libv2ray-sources.jar ../out/ 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libv2ray-aar
+          path: out/
