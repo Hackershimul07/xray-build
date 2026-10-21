@@ -1,0 +1,70 @@
+name: OpenVPN3 explore + SWIG wrapper
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "openvpn3 branch / tag / commit"
+        default: "master"
+
+jobs:
+  explore:
+    runs-on: ubuntu-latest
+    env:
+      REF: ${{ inputs.ref }}
+    steps:
+      - name: Install swig
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends swig
+
+      - name: Clone openvpn3
+        run: |
+          git clone https://github.com/OpenVPN/openvpn3.git core
+          cd core
+          git checkout "$REF"
+          git log -1 --format='commit %H %cd'
+          git describe --tags --always || true
+          git tag --sort=-v:refname | head -15 || true
+
+      - name: Dump upstream Android build files
+        run: |
+          mkdir -p out
+          cd core
+          {
+            echo "##### javacli tree"
+            find javacli -type f | sort
+            echo
+            echo "##### javacli build-related files"
+            for f in $(find javacli -type f \( -name '*.txt' -o -name '*.sh' -o -name 'build*' -o -name '*.cmake' -o -name '*.gradle' -o -name 'vars*' -o -name '*.mk' -o -name '*.md' -o -name '*.json' -o -name '*.yml' \) | sort); do
+              echo; echo "=== $f"; head -200 "$f"
+            done
+            echo
+            echo "##### client/CMakeLists.txt"; head -200 client/CMakeLists.txt
+            echo
+            echo "##### cmake/findcoredeps.cmake"; head -200 cmake/findcoredeps.cmake
+            echo
+            echo "##### vcpkg.json"; cat vcpkg.json
+            echo
+            echo "##### deps"; ls deps || true
+            echo
+            echo "##### android mentions in workflows"; grep -rn -i android .github/workflows | head -40 || true
+          } > ../out/explore.txt 2>&1 || true
+          wc -l ../out/explore.txt
+          head -120 ../out/explore.txt
+
+      - name: Generate Java wrapper (package net.openvpn.openvpn)
+        run: |
+          cd core/javacli
+          mkdir -p ../../out/java
+          swig -c++ -java -package net.openvpn.openvpn \
+            -outdir ../../out/java \
+            -o ../../out/ovpncli_wrap.cxx \
+            -I.. -I../client -I../openvpn \
+            ovpncli.i 2>&1 | tee ../../out/swig.log
+          ls -la ../../out/java | head -60
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openvpn3-explore
+          path: out/
