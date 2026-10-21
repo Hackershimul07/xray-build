@@ -1,0 +1,115 @@
+name: Build libtun2socks.so (16 KB aligned, from V2RayNG source)
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Repo that contains compile-tun2socks.sh + tun2socks.mk + badvpn + libancillary"
+        default: "2dust/v2rayNG"
+      ref:
+        description: "branch / tag / commit (empty = auto: newest commit that still has tun2socks.mk)"
+        default: ""
+      api:
+        description: "Android API level (app minSdk = 21)"
+        default: "21"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      API: ${{ inputs.api }}
+      REF: ${{ inputs.ref }}
+    steps:
+      - name: Checkout (full history, submodules later)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repo }}
+          path: src
+          fetch-depth: 0
+          submodules: false
+
+      - name: Select a commit that still contains tun2socks.mk
+        shell: bash
+        run: |
+          set -e
+          cd src
+          if [ -n "$REF" ]; then
+            git checkout "$REF"
+          elif [ ! -f tun2socks.mk ]; then
+            # newer V2RayNG removed badvpn; go to the commit just before tun2socks.mk was deleted
+            LAST="$(git rev-list -n 1 HEAD -- tun2socks.mk)"
+            echo "last commit touching tun2socks.mk: $LAST"
+            git checkout "${LAST}^"
+          fi
+          git log -1 --format='commit %H %cd'
+          ls
+          test -f tun2socks.mk || { echo "tun2socks.mk not found at this ref - set a different 'ref'"; exit 1; }
+          test -f compile-tun2socks.sh && echo "--- compile-tun2socks.sh" && cat compile-tun2socks.sh || true
+          echo "--- .gitmodules"; cat .gitmodules || true
+          git submodule update --init --recursive badvpn libancillary || git submodule update --init --recursive
+          ls badvpn | head -5
+          ls libancillary | head -5
+
+      - name: Build with ndk-build (16 KB page size)
+        shell: bash
+        run: |
+          set -e
+          # Use the runner's default NDK (LTS). The newest NDK may break this old makefile.
+          NDK="${ANDROID_NDK_HOME:-$ANDROID_NDK_LATEST_HOME}"
+          echo "NDK=$NDK"
+          ROOT="$PWD"
+          SRC="$ROOT/src"
+          TMP="$(mktemp -d)"
+          install -m644 "$SRC/tun2socks.mk" "$TMP/"
+          cd "$TMP"
+          ln -s "$SRC/badvpn" badvpn
+          ln -s "$SRC/libancillary" libancillary
+          "$NDK/ndk-build" \
+            NDK_PROJECT_PATH=. \
+            APP_BUILD_SCRIPT=./tun2socks.mk \
+            APP_ABI="arm64-v8a armeabi-v7a" \
+            APP_PLATFORM="android-$API" \
+            APP_LDFLAGS="-Wl,-z,max-page-size=16384" \
+            NDK_LIBS_OUT="$TMP/libs" \
+            NDK_OUT="$TMP/tmp" \
+            APP_SHORT_COMMANDS=false LOCAL_SHORT_COMMANDS=false -B -j"$(nproc)"
+          for ABI in arm64-v8a armeabi-v7a; do
+            F="$(find "$TMP/libs/$ABI" -maxdepth 1 -type f \( -name tun2socks -o -name libtun2socks.so \) | head -1)"
+            if [ -z "$F" ]; then echo "output not found for $ABI"; ls -R "$TMP/libs" || true; exit 1; fi
+            mkdir -p "$ROOT/out/jniLibs/$ABI"
+            cp "$F" "$ROOT/out/jniLibs/$ABI/libtun2socks.so"
+            "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" "$ROOT/out/jniLibs/$ABI/libtun2socks.so" || true
+          done
+
+      - name: Verify (alignment + options used by the app)
+        shell: bash
+        run: |
+          set +e
+          FAIL=0
+          REPORT=out/verify.txt
+          : > "$REPORT"
+          for ABI in arm64-v8a armeabi-v7a; do
+            F="out/jniLibs/$ABI/libtun2socks.so"
+            echo "=== $ABI" | tee -a "$REPORT"
+            ls -la "$F" | tee -a "$REPORT"
+            echo "LOAD alignment:" | tee -a "$REPORT"
+            readelf -lW "$F" | awk '/LOAD/{print $NF}' | sort -u | tee -a "$REPORT"
+            if readelf -lW "$F" | awk '/LOAD/{print $NF}' | grep -qx "0x1000"; then
+              echo "!! $ABI still has 4 KB alignment" | tee -a "$REPORT"; FAIL=1
+            fi
+            for OPT in "--netif-ipaddr" "--netif-netmask" "--socks-server-addr" "--tunmtu" "--sock-path" "--enable-udprelay" "--netif-ip6addr" "--dnsgw" "--loglevel"; do
+              if strings -a "$F" | grep -q -- "$OPT"; then
+                echo "ok      $OPT" | tee -a "$REPORT"
+              else
+                echo "MISSING $OPT" | tee -a "$REPORT"; FAIL=1
+              fi
+            done
+            strings -a "$F" | grep -m1 "BadVPN tun2socks" | tee -a "$REPORT"
+          done
+          if [ "$FAIL" = "1" ]; then echo "VERIFY FAILED - see out/verify.txt"; exit 1; fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tun2socks-16kb
+          path: out/
