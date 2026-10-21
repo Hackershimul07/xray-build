@@ -1,0 +1,122 @@
+name: Build OpenVPN3 core (libovpncli.so + Java wrapper)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "openvpn3 branch / tag / commit"
+        default: "master"
+      api:
+        description: "Android API level used for compiling (app minSdk = 21)"
+        default: "21"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      REF: ${{ inputs.ref }}
+      API: ${{ inputs.api }}
+    steps:
+      - name: Install swig
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends swig
+
+      - name: Clone openvpn3
+        run: |
+          git clone https://github.com/OpenVPN/openvpn3.git core
+          cd core
+          git checkout "$REF"
+          git log -1 --format='commit %H %cd'
+          git describe --tags --always || true
+          mkdir -p ../out
+          {
+            echo "commit: $(git rev-parse HEAD)"
+            echo "describe: $(git describe --tags --always || true)"
+            echo "--- platform macros"
+            grep -rn -E "OPENVPN_PLATFORM_ANDROID|USE_TUN_BUILDER|OPENVPN_PACKAGE_ID" client/ovpncli.cpp openvpn/common/platform.hpp 2>/dev/null | head -40 || true
+            echo "--- vcpkg ports"
+            ls deps/vcpkg-ports 2>/dev/null || true
+          } > ../out/info.txt
+          cat ../out/info.txt
+
+      - name: Generate Java wrapper (package net.openvpn.openvpn)
+        shell: bash
+        run: |
+          mkdir -p out/java
+          swig -c++ -java -package net.openvpn.openvpn \
+            -outdir out/java \
+            -o out/ovpncli_wrap.cxx \
+            -Icore -Icore/client -Icore/openvpn \
+            core/client/ovpncli.i 2>&1 | tee out/swig.log
+          ls -la out/java | head -80
+
+      - name: Cache vcpkg binaries
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/vcpkg/archives
+          key: vcpkg-android-openvpn3-v1
+
+      - name: Install dependencies with vcpkg (arm64 + armv7)
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.cache/vcpkg/archives"
+          export VCPKG_DEFAULT_BINARY_CACHE="$HOME/.cache/vcpkg/archives"
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          echo "NDK=$NDK"
+          export ANDROID_NDK_HOME="$NDK"
+          export VCPKG_ROOT="$VCPKG_INSTALLATION_ROOT"
+          git -C "$VCPKG_ROOT" pull --ff-only || true
+          mkdir -p vcpkg_manifest
+          cat > vcpkg_manifest/vcpkg.json << 'JSON'
+          {
+            "name": "o3deps",
+            "version-string": "0",
+            "dependencies": ["asio", "fmt", "lz4", "openssl", "xxhash", "jsoncpp"]
+          }
+          JSON
+          OVERLAY=""
+          if [ -d core/deps/vcpkg-ports ]; then OVERLAY="--overlay-ports=$PWD/core/deps/vcpkg-ports"; fi
+          for T in arm64-android arm-neon-android; do
+            "$VCPKG_ROOT/vcpkg" install --triplet "$T" \
+              --x-manifest-root="$PWD/vcpkg_manifest" \
+              --x-install-root="$PWD/vcpkg_out" \
+              $OVERLAY --clean-after-build
+          done
+          ls vcpkg_out/*/lib
+
+      - name: Build libovpncli.so
+        shell: bash
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          mkdir -p out/libs
+
+          build_abi () {
+            local ABI="$1" TRIPLET="$2" CLANG="$3"
+            local PFX="$PWD/vcpkg_out/$TRIPLET"
+            local EXTRA=""
+            [ -f "$PFX/lib/libxxhash.a" ] && EXTRA="$EXTRA -lxxhash"
+            [ -f "$PFX/lib/libjsoncpp.a" ] && EXTRA="$EXTRA -ljsoncpp"
+            mkdir -p "out/libs/$ABI"
+            echo "=== building $ABI"
+            "$TC/${CLANG}${API}-clang++" -std=c++20 -O2 -fPIC -shared -w \
+              -DASIO_STANDALONE -DUSE_ASIO -DHAVE_LZ4 -DUSE_OPENSSL -DHAVE_JSONCPP \
+              -DOPENVPN_PACKAGE_ID=net_openvpn_openvpn \
+              -I core -I core/client -I "$PFX/include" \
+              out/ovpncli_wrap.cxx core/client/ovpncli.cpp core/openvpn/crypto/data_epoch.cpp \
+              -L"$PFX/lib" -Wl,--start-group -lssl -lcrypto -llz4 -lfmt $EXTRA -Wl,--end-group \
+              -llog -ldl -static-libstdc++ \
+              -Wl,--exclude-libs,ALL -Wl,-z,max-page-size=16384 -Wl,-s \
+              -o "out/libs/$ABI/libovpncli.so"
+            ls -la "out/libs/$ABI/libovpncli.so"
+          }
+
+          build_abi arm64-v8a   arm64-android    aarch64-linux-android
+          build_abi armeabi-v7a arm-neon-android armv7a-linux-androideabi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: openvpn3-build
+          path: out/
