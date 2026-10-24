@@ -1,0 +1,38 @@
+name: Build hev-socks5-tunnel (Android)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone latest release
+        run: |
+          git clone --recursive https://github.com/heiher/hev-socks5-tunnel
+          cd hev-socks5-tunnel
+          TAG=$(git describe --tags --abbrev=0)
+          echo "Building $TAG"
+          git checkout "$TAG"
+          git submodule update --init --recursive
+
+      - name: Build with NDK
+        run: |
+          cd hev-socks5-tunnel
+          mkdir -p jni
+          echo 'include $(call all-subdir-makefiles)' > jni/Android.mk
+          ln -sf .. jni/hev-socks5-tunnel
+          "$ANDROID_NDK_HOME/ndk-build" \
+            NDK_PROJECT_PATH=. \
+            APP_BUILD_SCRIPT=jni/Android.mk \
+            APP_ABI="armeabi-v7a arm64-v8a" \
+            APP_PLATFORM=android-21 \
+            NDK_LIBS_OUT=./libs
+
+      - name: Show result
+        run: ls -lR hev-socks5-tunnel/libs
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jniLibs
+          path: hev-socks5-tunnel/libs
